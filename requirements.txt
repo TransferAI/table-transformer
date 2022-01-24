@@ -1,0 +1,6 @@
+pycocotools
+pymupdf
+scipy
+torch
+torchvision
+tqdm

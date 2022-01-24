@@ -7,6 +7,7 @@ import os
 import sys
 from typing import Iterable
 
+import numpy as np
 import torch
 
 import util.misc as utils
@@ -69,7 +70,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 @torch.no_grad()
-def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, output_dir):
+def evaluate(model, criterion, postprocessors, data_loader, base_ds, eval_freq, device, output_dir):
     model.eval()
     criterion.eval()
 
@@ -79,6 +80,8 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
 
     iou_types = tuple(k for k in ('segm', 'bbox') if k in postprocessors.keys())
     coco_evaluator = CocoEvaluator(base_ds, iou_types)
+    stats = {}
+
     # coco_evaluator.coco_eval[iou_types[0]].params.iouThrs = [0, 0.1, 0.5, 0.75]
 
     panoptic_evaluator = None
@@ -89,7 +92,7 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
             output_dir=os.path.join(output_dir, "panoptic_eval"),
         )
 
-    for samples, targets in metric_logger.log_every(data_loader, 1000, header):
+    for i, (samples, targets) in enumerate(metric_logger.log_every(data_loader, 1000, header)):
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
@@ -127,27 +130,50 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
 
             panoptic_evaluator.update(res_pano)
 
+        is_eval = (((i % eval_freq == 0) and (i != 0)) or (i + 1) == len(data_loader))
+        if (coco_evaluator is not None) and is_eval:
+            print('Starting COCO evaluation')
+            coco_evaluator.synchronize_between_processes()
+            coco_evaluator.accumulate()
+            coco_evaluator.summarize()
+
+            if 'bbox' in postprocessors.keys():
+                if not 'coco_eval_bbox' in stats:
+                    stats['coco_eval_bbox'] = coco_evaluator.coco_eval['bbox'].stats
+                else:
+                    diff = (coco_evaluator.coco_eval['bbox'].stats - stats['coco_eval_bbox'])
+                    stats['coco_eval_bbox'] += diff / (i / eval_freq) 
+
+            if 'segm' in postprocessors.keys():
+                if not 'coco_eval_masks' in stats:
+                    stats['coco_eval_masks'] = coco_evaluator.coco_eval['segm'].stats
+                else:
+                    diff = (coco_evaluator.coco_eval['segm'].stats - stats['coco_eval_masks'])
+                    stats['coco_eval_masks'] += diff / (i / eval_freq) 
+
+            if 'bbox' in postprocessors.keys():
+                print("pubmed: AP50: {:.3f}, AP75: {:.3f}, AP: {:.3f}, AR: {:.3f}".
+                      format(stats['coco_eval_bbox'][1],
+                             stats['coco_eval_bbox'][2],
+                             stats['coco_eval_bbox'][0],
+                             stats['coco_eval_bbox'][8]))
+
+            coco_evaluator.img_ids = []
+            coco_evaluator.eval_imgs = {k: [] for k in iou_types}
+            print('Finished COCO evaluation')
+
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
-    if coco_evaluator is not None:
-        coco_evaluator.synchronize_between_processes()
     if panoptic_evaluator is not None:
         panoptic_evaluator.synchronize_between_processes()
 
     # accumulate predictions from all images
-    if coco_evaluator is not None:
-        coco_evaluator.accumulate()
-        coco_evaluator.summarize()
     panoptic_res = None
     if panoptic_evaluator is not None:
         panoptic_res = panoptic_evaluator.summarize()
-    stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-    if coco_evaluator is not None:
-        if 'bbox' in postprocessors.keys():
-            stats['coco_eval_bbox'] = coco_evaluator.coco_eval['bbox'].stats.tolist()
-        if 'segm' in postprocessors.keys():
-            stats['coco_eval_masks'] = coco_evaluator.coco_eval['segm'].stats.tolist()
+    stats.update({k: meter.global_avg for k, meter in metric_logger.meters.items()})
+
     if panoptic_res is not None:
         stats['PQ_all'] = panoptic_res["All"]
         stats['PQ_th'] = panoptic_res["Things"]

@@ -43,6 +43,7 @@ def get_args():
                         choices=['train', 'eval', 'grits'],
                         default='train',
                         help="Toggle between different modes")
+    parser.add_argument('--num-samples-per-epoch', type=int)
     parser.add_argument('--debug', action='store_true')
 
     return parser.parse_args()
@@ -155,7 +156,10 @@ def get_data(args):
                                        xml_fileset="val_filelist.txt",
                                        class_map=class_map)
 
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
+        sampler_train = torch.utils.data.RandomSampler(
+                dataset_train, 
+                replacement=True,
+                num_samples=args.num_samples_per_epoch)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
         batch_sampler_train = torch.utils.data.BatchSampler(sampler_train,
@@ -167,7 +171,7 @@ def get_data(args):
                                        collate_fn=utils.collate_fn,
                                        num_workers=args.num_workers)
         data_loader_val = DataLoader(dataset_val,
-                                     2 * args.batch_size,
+                                     3 * args.batch_size,
                                      sampler=sampler_val,
                                      drop_last=False,
                                      collate_fn=utils.collate_fn,
@@ -178,17 +182,17 @@ def get_data(args):
     elif args.mode == "eval":
 
         dataset_test = PDFTablesDataset(os.path.join(args.data_root_dir,
-                                                     "test"),
+                                                     "val"),
                                         get_transform(args.data_type, "val"),
                                         do_crop=False,
                                         make_coco=True,
                                         image_extension=".jpg",
-                                        xml_fileset="test_filelist.txt",
+                                        xml_fileset="val_filelist.txt",
                                         class_map=class_map)
         sampler_test = torch.utils.data.SequentialSampler(dataset_test)
 
         data_loader_test = DataLoader(dataset_test,
-                                      2 * args.batch_size,
+                                      3 * args.batch_size,
                                       sampler=sampler_test,
                                       drop_last=False,
                                       collate_fn=utils.collate_fn,
@@ -218,12 +222,15 @@ def get_model(args, device):
         print("loading model from checkpoint")
         loaded_state_dict = torch.load(args.model_load_path,
                                        map_location=device)
+        if 'model_state_dict' in loaded_state_dict:
+            loaded_state_dict = loaded_state_dict['model_state_dict']
         model_state_dict = model.state_dict()
         pretrained_dict = {
             k: v
             for k, v in loaded_state_dict.items()
             if k in model_state_dict and model_state_dict[k].shape == v.shape
         }
+        assert len(pretrained_dict) == len(model_state_dict)
         model_state_dict.update(pretrained_dict)
         model.load_state_dict(model_state_dict, strict=True)
     return model, criterion, postprocessors
@@ -236,7 +243,7 @@ def eval(args, model, criterion, postprocessors, device):
     """
     data_loader_test, dataset_test = get_data(args)
     pubmed_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
-                                            data_loader_test, dataset_test,
+                                            data_loader_test, dataset_test, 3000,
                                             device, None)
     print("pubmed: AP50: {:.3f}, AP75: {:.3f}, AP: {:.3f}, AR: {:.3f}".format(
         pubmed_stats['coco_eval_bbox'][1], pubmed_stats['coco_eval_bbox'][2],
@@ -288,18 +295,18 @@ def train(args, model, criterion, postprocessors, device):
                                                    step_size=args.lr_drop,
                                                    gamma=args.lr_gamma)
 
-    max_batches_per_epoch = int(train_len / args.batch_size)
+    max_batches_per_epoch = train_len // args.batch_size
     print("Max batches per epoch: {}".format(max_batches_per_epoch))
 
     if args.model_load_path:
         checkpoint = torch.load(args.model_load_path, map_location='cpu')
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.to(device)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         args.start_epoch = checkpoint['epoch'] + 1
 
     print("Start training")
     start_time = datetime.now()
+    eval_freq = train_len // (len(data_loader_train) * args.batch_size)
+    print(f"Evaluate every {eval_freq} epochs.")
     for epoch in range(args.start_epoch, args.epochs):
         print('-' * 100)
 
@@ -318,22 +325,24 @@ def train(args, model, criterion, postprocessors, device):
 
         lr_scheduler.step()
 
-        pubmed_stats, coco_evaluator = evaluate(model, criterion,
-                                                postprocessors,
-                                                data_loader_val, dataset_val,
-                                                device, None)
-        print("pubmed: AP50: {:.3f}, AP75: {:.3f}, AP: {:.3f}, AR: {:.3f}".
-              format(pubmed_stats['coco_eval_bbox'][1],
-                     pubmed_stats['coco_eval_bbox'][2],
-                     pubmed_stats['coco_eval_bbox'][0],
-                     pubmed_stats['coco_eval_bbox'][8]))
-
         torch.save({'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     }, model_save_path)
-        model_save_path_epoch = os.path.join(output_directory, 'model_' + str(epoch+1) + '.pth')
-        torch.save(model.state_dict(), model_save_path_epoch)
+
+        if (epoch + 1) % eval_freq == 0:
+            pubmed_stats, coco_evaluator = evaluate(model, criterion,
+                                                    postprocessors,
+                                                    data_loader_val, dataset_val, 3000,
+                                                    device, None)
+            print("pubmed: AP50: {:.3f}, AP75: {:.3f}, AP: {:.3f}, AR: {:.3f}".
+                  format(pubmed_stats['coco_eval_bbox'][1],
+                         pubmed_stats['coco_eval_bbox'][2],
+                         pubmed_stats['coco_eval_bbox'][0],
+                         pubmed_stats['coco_eval_bbox'][8]))
+
+            model_save_path_epoch = os.path.join(output_directory, 'model_' + str(epoch+1) + '.pth')
+            torch.save(model.state_dict(), model_save_path_epoch)
 
     print('Total training time: ', datetime.now() - start_time)
 

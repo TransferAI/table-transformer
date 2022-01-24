@@ -4,10 +4,10 @@ Copyright (C) 2021 Microsoft Corporation
 class Args:
     lr=5e-5
     lr_backbone=1e-5
-    batch_size=2
+    batch_size=3
     weight_decay=1e-4
-    epochs=20
-    lr_drop=1
+    epochs=100
+    lr_drop=5
     lr_gamma=0.9
     clip_max_norm=0.1
     
@@ -50,4 +50,4 @@ class Args:
     device='cuda'
     seed=42
     start_epoch=0
-    num_workers=1
+    num_workers=3
